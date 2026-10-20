@@ -40,6 +40,8 @@ public type Tool record {|
     isolated function caller;
     # Optional authorization configuration required to invoke this tool.
     AgentIdAuthConfig|Scopes auth?;
+    # Scopes required for the client_credentials grant flow.
+    string[] scopes?;
     # When `true`, the agent pauses and requests human approval before invoking this tool.
     # A function value gates only the calls it evaluates to `true` for, based on the proposed
     # arguments.
@@ -261,6 +263,7 @@ isolated function getToolConfig(FunctionTool tool) returns ToolConfig|Error {
             parameters: check config?.parameters.ensureType(),
             caller: tool,
             auth: check config?.auth.ensureType(),
+            scopes: check config?.scopes.ensureType(),
             requiresApproval: config.requiresApproval
         };
     } on fail error e {
@@ -352,6 +355,7 @@ isolated function registerTool(map<Tool & readonly> toolMap, ToolConfig[] tools)
             constants,
             caller: tool.caller,
             auth: tool.auth,
+            scopes: tool.scopes,
             requiresApproval: tool.requiresApproval
         };
         toolMap[name] = agentTool.cloneReadOnly();
@@ -459,14 +463,16 @@ isolated function validateToolNameAndInput(LlmToolResponse action, map<Tool> & r
     }
 }
 
-isolated function validateTool(LlmToolResponse action, Credential? agentCredential, cache:Cache tokenManager,
+isolated function validateTool(LlmToolResponse action, Credential? agentCredential,
+    ClientCredential? clientCredentialAuth, cache:Cache tokenManager,
     Context context, map<Tool> & readonly tool, boolean isMcpTool) returns
     ToolNotFoundError|ToolInvalidInputError|TokenAcquisitionError|TokenValidationError? {
     string toolName = action.name;
-    string? agentId = agentCredential is Credential ? agentCredential.id : ();
+    string? agentId = agentCredential is Credential ? agentCredential.id :
+                      (clientCredentialAuth is ClientCredential ? clientCredentialAuth.clientId : ());
     check validateToolNameAndInput(action, tool, agentId);
 
-    check authorizeToolInvocation(agentCredential, tokenManager, context, tool, toolName);
+    check authorizeToolInvocation(agentCredential, clientCredentialAuth, tokenManager, context, tool, toolName);
 
     log:printDebug("Executing tool",
         agentId = agentId,
@@ -474,26 +480,55 @@ isolated function validateTool(LlmToolResponse action, Credential? agentCredenti
     );
 }
 
-isolated function authorizeToolInvocation (Credential? agentCredential, cache:Cache tokenManager, 
-    Context context, map<Tool> & readonly tool, string toolName) returns 
+isolated function authorizeToolInvocation(Credential? agentCredential,
+    ClientCredential? clientCredentialAuth, cache:Cache tokenManager,
+    Context context, map<Tool> & readonly tool, string toolName) returns
     TokenAcquisitionError|TokenValidationError? {
-    AgentIdAuthConfig|Scopes? auth = tool.get(toolName).auth;
-    string? agentId = agentCredential is Credential ? agentCredential.id : ();
-    string[]|string? scopes = ();
-    if auth is AgentIdAuthConfig|Scopes {
-        scopes = auth?.scopes;
+    Tool currentTool = tool.get(toolName);
+    AgentIdAuthConfig|Scopes? auth = currentTool.auth;
+    string[]? toolScopes = currentTool.scopes;
+
+    // New client_credentials flow: agent-level ClientCredential + tool-level scopes
+    if clientCredentialAuth is ClientCredential && toolScopes is string[] {
+        string|string[]? rawAgentScopes = clientCredentialAuth.scopes;
+        string[] agentScopes;
+        if rawAgentScopes is string[] {
+            agentScopes = rawAgentScopes;
+        } else if rawAgentScopes is string {
+            agentScopes = [rawAgentScopes];
+        } else {
+            agentScopes = [];
+        }
+        string[] effectiveScopes = toolScopes.length() > 0 ? toolScopes : agentScopes;
+        map<()>? result = check getClientCredentialToken(clientCredentialAuth, toolName,
+                                effectiveScopes, tokenManager, context);
+        if result is map<()> {
+            check validateToolScope(result, toolName, effectiveScopes, clientCredentialAuth.clientId);
+        }
+        any|error cachedToken = tokenManager.get(toolName);
+        if cachedToken is TokenCache {
+            context.setAccessToken(toolName, cachedToken.getAccessToken());
+        }
+        return;
     }
-    if agentCredential is Credential && auth is AgentIdAuthConfig {     
+
+    // Legacy Authorization Code flow: per-tool AgentIdAuthConfig + agent Credential
+    string? agentId = agentCredential is Credential ? agentCredential.id : ();
+    string[]|string? legacyScopes = ();
+    if auth is AgentIdAuthConfig|Scopes {
+        legacyScopes = auth?.scopes;
+    }
+    if agentCredential is Credential && auth is AgentIdAuthConfig {
         map<()>? result = check getToolScopes(agentCredential, auth, tokenManager, toolName, context);
         if result is () {
             return;
         }
-        check validateToolScope(result, toolName, scopes, agentCredential.id);
+        check validateToolScope(result, toolName, legacyScopes, agentCredential.id);
         any|error token = tokenManager.get(toolName);
         if token is TokenCache {
             context.setAccessToken(toolName, token.getAccessToken());
         }
-    } else if scopes !is () && (auth !is  AgentIdAuthConfig|| agentCredential is ()) {
+    } else if legacyScopes !is () && (auth !is AgentIdAuthConfig || agentCredential is ()) {
         log:printError("Authorization is required for the tool, but no agent credential " +
             "or auth configuration was provided.", toolName = toolName, agentId = agentId);
         return error TokenAcquisitionError("Authorization is required for the tool, but no agent " +

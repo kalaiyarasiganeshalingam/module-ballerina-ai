@@ -48,6 +48,8 @@ const APPLICATION_X_WWW_FORM_URLENCODED = "application/x-www-form-urlencoded";
 const AUTHN_HEADER = "authn";
 const AUTHORIZE = "authorize";
 const AUTHORIZATION_CODE = "authorization_code";
+const CLIENT_CREDENTIALS = "client_credentials";
+const PRIVATE_KEY_JWT_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 const TOKEN = "token";
 const INTROSPECT = "introspect";
 const TOKEN_WITH_EQUAL = "token=";

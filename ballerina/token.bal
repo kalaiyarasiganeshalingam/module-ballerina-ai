@@ -18,6 +18,7 @@ import ai.observe;
 import ballerina/cache;
 import ballerina/crypto;
 import ballerina/http;
+import ballerina/oauth2;
 import ballerina/jwt;
 import ballerina/lang.'string as strings;
 import ballerina/lang.regexp;
@@ -64,6 +65,127 @@ type Token record {
 type Code record {
     record {string code;} authData;
 };
+
+// ── client_credentials grant flow ─────────────────────────────────────────────────────────────
+
+isolated function getClientCredentialToken(ClientCredential clientCredentialAuth,
+        string toolName, string[] toolScopes, cache:Cache tokenManager, Context context)
+        returns TokenAcquisitionError|TokenValidationError|InsufficientScopeError|map<()>? {
+    boolean needsRefresh = true;
+    map<()> scopeInToken = {};
+    if tokenManager.hasKey(toolName) {
+        any|error cached = tokenManager.get(toolName);
+        if cached is TokenCache {
+            needsRefresh = cached.isAccessTokenExpired();
+            scopeInToken = cached.getScopes();
+        }
+    }
+    if needsRefresh {
+        log:printDebug("Requesting a new client_credentials token for tool: ",
+            clientId = clientCredentialAuth.clientId,
+            toolName = toolName,
+            scopes = toolScopes
+        );
+        Token freshToken = check fetchClientCredentialToken(clientCredentialAuth, toolScopes);
+        error|map<()> result = validateToken(toolName, freshToken, tokenManager,
+                clockSkew = clientCredentialAuth.clockSkew,
+                defaultExpTime = clientCredentialAuth.defaultTokenExpTime);
+        if result is error {
+            return error TokenValidationError(result.message());
+        }
+        return result;
+    }
+    return scopeInToken;
+}
+
+isolated function fetchClientCredentialToken(ClientCredential credential, string[] scopes)
+        returns Token|TokenAcquisitionError {
+    http:Client|http:ClientError tokenClient = new (credential.tokenUrl,
+        toHttpClientConfig(credential.clientConfig));
+    if tokenClient is http:ClientError {
+        return error TokenAcquisitionError("Failed to create HTTP client for token endpoint",
+            detail = {cause: tokenClient});
+    }
+
+    map<string> formData = {
+        grant_type: CLIENT_CREDENTIALS,
+        client_id: credential.clientId
+    };
+    if scopes.length() > 0 {
+        formData["scope"] = string:'join(SPACE, ...scopes);
+    }
+    map<string>? optionalParams = credential.optionalParams;
+    if optionalParams is map<string> {
+        foreach var [k, v] in optionalParams.entries() {
+            formData[k] = v;
+        }
+    }
+
+    map<string|string[]> headers = {CONTENT_TYPE_HEADER: APPLICATION_X_WWW_FORM_URLENCODED};
+    map<string>? customHeaders = credential.clientConfig.customHeaders;
+    if customHeaders is map<string> {
+        foreach var [k, v] in customHeaders.entries() {
+            headers[k] = v;
+        }
+    }
+
+    ClientSecret|PrivateKeyJwt clientAuth = credential.clientAuth;
+    if clientAuth is ClientSecret {
+        if clientAuth.method != BODY {
+            string raw = credential.clientId + ":" + clientAuth.secret;
+            headers["Authorization"] = "Basic " + raw.toBytes().toBase64();
+        } else {
+            formData["client_secret"] = clientAuth.secret;
+        }
+    } else {
+        formData["client_assertion_type"] = PRIVATE_KEY_JWT_ASSERTION_TYPE;
+        formData["client_assertion"] = clientAuth.assertion;
+    }
+
+    string[] parts = [];
+    foreach var [k, v] in formData.entries() {
+        string|error encoded = url:encode(v, UTF8_ENCODING);
+        parts.push(string `${k}=${encoded is string ? encoded : v}`);
+    }
+    string body = string:'join(AMPERSAND, ...parts);
+
+    Token|error result = tokenClient->post("", body, headers);
+    if result is error {
+        log:printError("Failed to obtain access token via client_credentials",
+            'error = result, clientId = credential.clientId, tokenUrl = credential.tokenUrl);
+        return error TokenAcquisitionError("Failed to obtain access token via client_credentials",
+            detail = {cause: result});
+    }
+    log:printDebug("Successfully obtained client_credentials access token",
+        clientId = credential.clientId, toolScopes = scopes);
+    return result;
+}
+
+isolated function toHttpClientConfig(oauth2:ClientConfiguration config) returns http:ClientConfiguration {
+    http:ClientSecureSocket? httpSecureSocket = ();
+    oauth2:SecureSocket? oauthSecureSocket = config.secureSocket;
+    if oauthSecureSocket is oauth2:SecureSocket {
+        http:ClientSecureSocket ss = {enable: !oauthSecureSocket.disable};
+        crypto:TrustStore|string? cert = oauthSecureSocket.cert;
+        if cert is crypto:TrustStore|string {
+            ss.cert = cert;
+        }
+        oauth2:CertKey|crypto:KeyStore? key = oauthSecureSocket.key;
+        if key is oauth2:CertKey {
+            ss.key = {certFile: key.certFile, keyFile: key.keyFile, keyPassword: key.keyPassword};
+        } else if key is crypto:KeyStore {
+            ss.key = key;
+        }
+        httpSecureSocket = ss;
+    }
+    return {
+        httpVersion: config.httpVersion == oauth2:HTTP_2 ? http:HTTP_2_0 : http:HTTP_1_1,
+        timeout: config.reqTimeout ?: 30,
+        secureSocket: httpSecureSocket
+    };
+}
+
+// ── authorization-code grant flow (legacy) ────────────────────────────────────────────────────
 
 isolated function getToolScopes(Credential agentCredential, AgentIdAuthConfig agentIdAuthConfig, 
     cache:Cache tokenManager, string toolName, Context context) returns 
@@ -244,8 +366,9 @@ isolated function getToken(string code, string clientId, string redirectUri, str
         {"Content-Type": APPLICATION_X_WWW_FORM_URLENCODED});
 }
 
-isolated function addToken(string toolName, Token token, cache:Cache tokenManager) returns map<()> {
-    TokenCache tokenCache = new (token);
+isolated function addToken(string toolName, Token token, cache:Cache tokenManager,
+        decimal clockSkew = 10) returns map<()> {
+    TokenCache tokenCache = new (token, clockSkew);
     cache:Error? output = tokenManager.put(toolName, tokenCache);
     if output is cache:Error {
         log:printError("Failed to store token in cache", output, toolName = toolName);
@@ -253,21 +376,31 @@ isolated function addToken(string toolName, Token token, cache:Cache tokenManage
     return tokenCache.getScopes();
 }
 
-isolated function validateToken(string toolName, Token token, cache:Cache tokenManager) returns error| map<()> {
+isolated function validateToken(string toolName, Token token, cache:Cache tokenManager,
+        decimal clockSkew = 10, decimal defaultExpTime = 3600) returns error|map<()> {
     observe:ValidateTokenSpan validateTokenSpan = observe:createValidateTokenSpan("WSO2");
-    jwt:Payload decode = (check jwt:decode(token.access_token))[1];
-    [int, decimal] currentTime = time:utcNow();
-    if (currentTime[0] <= decode?.exp) {
-        token.scope = decode["scope"].toString();
-        token.expires_in = <int>decode["exp"];
-        validateTokenSpan.addValidationResult(true, decode["client_id"].toString(), decode?.sub);
+    jwt:Payload|error decoded = jwt:decode(token.access_token).ensureType();
+    if decoded is error {
+        // Opaque (non-JWT) token — rely on the expires_in from the token response or the default.
+        int expiry = token.expires_in > 0 ? token.expires_in : <int>defaultExpTime;
+        token.expires_in = expiry;
+        validateTokenSpan.addValidationResult(true, "", ());
         validateTokenSpan.close();
-        return addToken(toolName, token, tokenManager);
+        return addToken(toolName, token, tokenManager, clockSkew);
     }
-    validateTokenSpan.addValidationResult(false, decode["client_id"].toString(), decode?.sub);
+    jwt:Payload jwtPayload = decoded;
+    [int, decimal] currentTime = time:utcNow();
+    if (currentTime[0] <= jwtPayload?.exp) {
+        token.scope = jwtPayload["scope"].toString();
+        token.expires_in = <int>jwtPayload["exp"];
+        validateTokenSpan.addValidationResult(true, jwtPayload["client_id"].toString(), jwtPayload?.sub);
+        validateTokenSpan.close();
+        return addToken(toolName, token, tokenManager, clockSkew);
+    }
+    validateTokenSpan.addValidationResult(false, jwtPayload["client_id"].toString(), jwtPayload?.sub);
     validateTokenSpan.close();
     return {};
-} 
+}
 
 isolated function validateToolScope(map<()> scopesInToken, string toolName, string|string[]? scopes, 
         string agentId) returns InsufficientScopeError? {

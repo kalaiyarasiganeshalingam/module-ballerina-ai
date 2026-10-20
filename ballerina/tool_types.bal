@@ -147,6 +147,12 @@ public type ToolConfig record {|
     # Optional authorization configuration required to invoke this tool.
     @display {label: "Authorization Configuration"}
     AgentIdAuthConfig|Scopes auth?;
+    # Scopes required to invoke this tool when the agent is configured with `ClientCredential`.
+    # The agent acquires a `client_credentials` token for these scopes and makes it available
+    # via `ai:Context.getAccessToken(toolName)`. A tool's scopes replace the agent-level
+    # `ClientCredential.scopes`; they are not merged.
+    @display {label: "Required Scopes"}
+    string[] scopes?;
     # When `true`, the agent pauses and requests human approval before invoking this tool.
     # A function value gates only the calls it evaluates to `true` for, based on the proposed
     # arguments.
@@ -158,15 +164,21 @@ public type ToolConfig record {|
 public type ToolAnnotationConfig record {|
     # The name of the tool. If not provided, defaults to the function pointer name.
     string name?;
-    # A description of the tool. This is used by LLMs to understand the tool's behavior.  
+    # A description of the tool. This is used by LLMs to understand the tool's behavior.
     # If not provided, the doc comment used as the description.
     string description?;
-    # The input schema expected by the tool. If the tool does not expect any input, this should be null.  
-    # If not provided, the input schema is generated automatically. 
+    # The input schema expected by the tool. If the tool does not expect any input, this should be null.
+    # If not provided, the input schema is generated automatically.
     ObjectInputSchema? parameters?;
     # Optional authorization configuration required to invoke this tool.
     @display {label: "Authorization Configuration"}
     AgentIdAuthConfig|Scopes auth?;
+    # Scopes required to invoke this tool when the agent is configured with `ClientCredential`.
+    # The agent acquires a `client_credentials` token for these scopes and makes it available
+    # via `ai:Context.getAccessToken(toolName)`. A tool's scopes replace the agent-level
+    # `ClientCredential.scopes`; they are not merged.
+    @display {label: "Required Scopes"}
+    string[] scopes?;
     # When `true`, the agent pauses and requests human approval before invoking this tool.
     # A function value gates only the calls it evaluates to `true` for, based on the proposed
     # arguments.

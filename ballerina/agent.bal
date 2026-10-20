@@ -21,6 +21,7 @@ import ballerina/jballerina.java;
 import ballerina/log;
 import ballerina/time;
 import ballerina/uuid;
+import ballerina/oauth2;
 
 const INFER_TOOL_COUNT = "INFER_TOOL_COUNT";
 const DEFAULT_MINIMUM_MAX_ITERATIONS = 10;
@@ -50,6 +51,48 @@ public type Credential record {|
     # The secret associated with the agent.
     @display {label: "Agent Secret"}
     string secret;
+|};
+
+# How a client secret is sent to the token endpoint.
+public enum ClientSecretMethod {
+    # client_secret_basic: sent in the `Authorization: Basic` header.
+    BASIC = "basic",
+    # client_secret_post: sent in the request body.
+    BODY = "post"
+}
+
+# Client secret authentication. The agent and the authorization server share the secret.
+@display {label: "Client Secret"}
+public type ClientSecret record {|
+    # Client secret of the agent. Provide it as a configurable, never inline.
+    @display {label: "Client Secret", kind: "password"}
+    string secret;
+    # How the client secret is sent to the token endpoint.
+    @display {label: "Authentication Method"}
+    ClientSecretMethod method = BASIC;
+|};
+
+# Private key JWT authentication (RFC 7523). The agent sends a signed client assertion;
+# the authorization server verifies it with the registered public key.
+@display {label: "Private Key JWT"}
+public type PrivateKeyJwt record {|
+    # Signed client assertion (JWT) sent as `client_assertion`. It must carry `iss` and
+    # `sub` set to the client ID, `aud`, `jti`, and `exp`.
+    # Provide it as a configurable, never inline.
+    @display {label: "Client Assertion", kind: "password"}
+    string assertion;
+|};
+
+# Client credentials configuration of an agent that acts on its own behalf as a
+# confidential client.
+@display {label: "Client Credential"}
+public type ClientCredential record {|
+    *oauth2:ClientCredentialsGrantConfig;
+    never clientSecret?;
+    # How the agent authenticates to the token endpoint: a client secret or a private key JWT.
+    # Replaces the `clientSecret` + `credentialBearer` pair in `oauth2:ClientCredentialsGrantConfig`.
+    @display {label: "Client Authentication"}
+    ClientSecret|PrivateKeyJwt clientAuth;
 |};
 
 # Provides a set of configurations for the agent.
@@ -99,6 +142,11 @@ public type AgentConfiguration record {|
     # Optional authentication details of the agent.
     @display {label: "Agent Credential"}
     Credential credential?;
+
+    # Identity the agent uses to obtain access tokens from the authorization server via the
+    # `client_credentials` grant. When absent, tools are invoked without an access token.
+    @display {label: "Agent Identity"}
+    ClientCredential auth?;
 |};
 
 # Represents the supported agent type abstractions: an agent whose return type is inferred from the call
@@ -218,6 +266,8 @@ public isolated distinct class Agent {
     final cache:Cache tokenManager = new ();
     # Authentication configuration used for acquiring OAuth tokens when accessing secured tools.
     final readonly & Credential? agentCredential;
+    # OAuth 2.0 client credentials configuration for the agent's own identity.
+    final readonly & ClientCredential? clientCredentialAuth;
     # Persists HITL pause checkpoints. The configured `memory` itself when it is a
     # `ShortTermMemory` (which persists checkpoints in its store), otherwise a private in-memory
     # `ShortTermMemory` fallback that is not durable across a restart or a run on another replica.
@@ -261,6 +311,10 @@ public isolated distinct class Agent {
                 agentIdentitySpan.addId(agentCredential.id);
             }
         }
+        ClientCredential? clientCredentialAuth = config.auth;
+        if agentCredential is () && clientCredentialAuth is ClientCredential {
+            self.agentId = clientCredentialAuth.clientId.cloneReadOnly();
+        }
         do {
             self.toolStore = check new (...config.tools);
             self.model = config.model;
@@ -269,6 +323,7 @@ public isolated distinct class Agent {
             self.toolLoadingStrategy = config.toolLoadingStrategy;
             self.executeToolCallsInParallel = config.executeToolCallsInParallel;
             self.agentCredential = agentCredential.cloneReadOnly();
+            self.clientCredentialAuth = clientCredentialAuth.cloneReadOnly();
             self.toolSchemas = self.toolStore.getToolSchema().cloneReadOnly();
             self.maxIter = maxIter is INFER_TOOL_COUNT ?
                 int:max(self.toolSchemas.length(), DEFAULT_MINIMUM_MAX_ITERATIONS) : maxIter;

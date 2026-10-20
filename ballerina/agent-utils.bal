@@ -444,7 +444,7 @@ isolated function executeToolCall(Agent agent, FunctionCall llmResponse, Context
     span.addArguments(llmResponse.arguments);
     ToolNotFoundError|ToolInvalidInputError|TokenAcquisitionError|TokenValidationError?
                 validateRes = validateTool(llmResponse, agent.agentCredential,
-            agent.tokenManager, context, toolStore.tools, isMcpTool);
+            agent.clientCredentialAuth, agent.tokenManager, context, toolStore.tools, isMcpTool);
     if validateRes is Error {
         log:printError("Tool validation failed",
                 agentId = agentId,
