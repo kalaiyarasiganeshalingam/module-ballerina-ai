@@ -133,6 +133,19 @@ public type JsonInputSchema ObjectInputSchema|ArrayInputSchema|AnyOfInputSchema|
 # Defines a json sub schema
 public type JsonSubSchema JsonInputSchema|PrimitiveInputSchema|ConstantValueSchema;
 
+# Permission required to execute this tool.
+@display {label: "Required Permission"}
+public type RequiredPermission record {|
+    # Scopes required to invoke this tool. These are merged with the agent-level
+    # scopes when requesting an access token for this tool.
+    @display {label: "Scopes"}
+    string[] scopes?;
+    # URL of the service this tool accesses. Used to obtain a token bound to this
+    # specific service and overrides any service URL configured at the agent level.
+    @display {label: "Service URL"}
+    string serviceUrl?;
+|};
+
 // tool definitions ----------------------------
 # Defines a tool. This is the only tool type directly understood by the agent. All other tool types are converted to this type using toolkits.
 public type ToolConfig record {|
@@ -147,12 +160,9 @@ public type ToolConfig record {|
     # Optional authorization configuration required to invoke this tool.
     @display {label: "Authorization Configuration"}
     AgentIdAuthConfig|Scopes auth?;
-    # Scopes required to invoke this tool when the agent is configured with `ClientCredential`.
-    # The agent acquires a `client_credentials` token for these scopes and makes it available
-    # via `ai:Context.getAccessToken(toolName)`. A tool's scopes replace the agent-level
-    # `ClientCredential.scopes`; they are not merged.
-    @display {label: "Required Scopes"}
-    string[] scopes?;
+    # Permission required to execute this tool.
+    @display {label: "Required Permission"}
+    RequiredPermission requiredPermission?;
     # When `true`, the agent pauses and requests human approval before invoking this tool.
     # A function value gates only the calls it evaluates to `true` for, based on the proposed
     # arguments.
@@ -173,12 +183,9 @@ public type ToolAnnotationConfig record {|
     # Optional authorization configuration required to invoke this tool.
     @display {label: "Authorization Configuration"}
     AgentIdAuthConfig|Scopes auth?;
-    # Scopes required to invoke this tool when the agent is configured with `ClientCredential`.
-    # The agent acquires a `client_credentials` token for these scopes and makes it available
-    # via `ai:Context.getAccessToken(toolName)`. A tool's scopes replace the agent-level
-    # `ClientCredential.scopes`; they are not merged.
-    @display {label: "Required Scopes"}
-    string[] scopes?;
+    # Permission required to execute this tool.
+    @display {label: "Required Permission"}
+    RequiredPermission requiredPermission?;
     # When `true`, the agent pauses and requests human approval before invoking this tool.
     # A function value gates only the calls it evaluates to `true` for, based on the proposed
     # arguments.

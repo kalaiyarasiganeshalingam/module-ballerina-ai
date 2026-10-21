@@ -88,6 +88,7 @@ public type PrivateKeyJwt record {|
 @display {label: "Client Credential"}
 public type ClientCredential record {|
     *oauth2:ClientCredentialsGrantConfig;
+    # Not used. Authentication is handled by `clientAuth`.
     never clientSecret?;
     # How the agent authenticates to the token endpoint: a client secret or a private key JWT.
     # Replaces the `clientSecret` + `credentialBearer` pair in `oauth2:ClientCredentialsGrantConfig`.

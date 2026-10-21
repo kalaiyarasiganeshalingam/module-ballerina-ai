@@ -40,8 +40,8 @@ public type Tool record {|
     isolated function caller;
     # Optional authorization configuration required to invoke this tool.
     AgentIdAuthConfig|Scopes auth?;
-    # Scopes required for the client_credentials grant flow.
-    string[] scopes?;
+    # Token configuration for the client_credentials grant flow.
+    RequiredPermission requiredPermission?;
     # When `true`, the agent pauses and requests human approval before invoking this tool.
     # A function value gates only the calls it evaluates to `true` for, based on the proposed
     # arguments.
@@ -263,7 +263,7 @@ isolated function getToolConfig(FunctionTool tool) returns ToolConfig|Error {
             parameters: check config?.parameters.ensureType(),
             caller: tool,
             auth: check config?.auth.ensureType(),
-            scopes: check config?.scopes.ensureType(),
+            requiredPermission: check config?.requiredPermission.ensureType(),
             requiresApproval: config.requiresApproval
         };
     } on fail error e {
@@ -355,7 +355,7 @@ isolated function registerTool(map<Tool & readonly> toolMap, ToolConfig[] tools)
             constants,
             caller: tool.caller,
             auth: tool.auth,
-            scopes: tool.scopes,
+            requiredPermission: tool.requiredPermission,
             requiresApproval: tool.requiresApproval
         };
         toolMap[name] = agentTool.cloneReadOnly();
@@ -486,10 +486,11 @@ isolated function authorizeToolInvocation(Credential? agentCredential,
     TokenAcquisitionError|TokenValidationError? {
     Tool currentTool = tool.get(toolName);
     AgentIdAuthConfig|Scopes? auth = currentTool.auth;
-    string[]? toolScopes = currentTool.scopes;
+    RequiredPermission? requiredPermission = currentTool.requiredPermission;
 
-    // New client_credentials flow: agent-level ClientCredential + tool-level scopes
-    if clientCredentialAuth is ClientCredential && toolScopes is string[] {
+    // New client_credentials flow: agent-level ClientCredential + tool-level RequiredPermission
+    if clientCredentialAuth is ClientCredential && requiredPermission is RequiredPermission {
+        string[] toolScopes = requiredPermission.scopes ?: [];
         string|string[]? rawAgentScopes = clientCredentialAuth.scopes;
         string[] agentScopes;
         if rawAgentScopes is string[] {
@@ -499,9 +500,18 @@ isolated function authorizeToolInvocation(Credential? agentCredential,
         } else {
             agentScopes = [];
         }
-        string[] effectiveScopes = toolScopes.length() > 0 ? toolScopes : agentScopes;
+        // Merge agent-level (common) scopes with tool-level scopes, deduplicating.
+        map<()> scopeSet = {};
+        foreach string s in agentScopes {
+            scopeSet[s] = ();
+        }
+        foreach string s in toolScopes {
+            scopeSet[s] = ();
+        }
+        string[] effectiveScopes = scopeSet.keys();
+        string? toolResource = requiredPermission.serviceUrl;
         map<()>? result = check getClientCredentialToken(clientCredentialAuth, toolName,
-                                effectiveScopes, tokenManager, context);
+                                effectiveScopes, toolResource, tokenManager, context);
         if result is map<()> {
             check validateToolScope(result, toolName, effectiveScopes, clientCredentialAuth.clientId);
         }

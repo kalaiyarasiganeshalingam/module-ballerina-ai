@@ -69,7 +69,7 @@ type Code record {
 // ── client_credentials grant flow ─────────────────────────────────────────────────────────────
 
 isolated function getClientCredentialToken(ClientCredential clientCredentialAuth,
-        string toolName, string[] toolScopes, cache:Cache tokenManager, Context context)
+        string toolName, string[] toolScopes, string? toolResource, cache:Cache tokenManager, Context context)
         returns TokenAcquisitionError|TokenValidationError|InsufficientScopeError|map<()>? {
     boolean needsRefresh = true;
     map<()> scopeInToken = {};
@@ -84,9 +84,10 @@ isolated function getClientCredentialToken(ClientCredential clientCredentialAuth
         log:printDebug("Requesting a new client_credentials token for tool: ",
             clientId = clientCredentialAuth.clientId,
             toolName = toolName,
-            scopes = toolScopes
+            scopes = toolScopes,
+            serviceUrl = toolResource
         );
-        Token freshToken = check fetchClientCredentialToken(clientCredentialAuth, toolScopes);
+        Token freshToken = check fetchClientCredentialToken(clientCredentialAuth, toolScopes, toolResource);
         error|map<()> result = validateToken(toolName, freshToken, tokenManager,
                 clockSkew = clientCredentialAuth.clockSkew,
                 defaultExpTime = clientCredentialAuth.defaultTokenExpTime);
@@ -98,10 +99,12 @@ isolated function getClientCredentialToken(ClientCredential clientCredentialAuth
     return scopeInToken;
 }
 
-isolated function fetchClientCredentialToken(ClientCredential credential, string[] scopes)
+isolated function fetchClientCredentialToken(ClientCredential credential, string[] scopes,
+        string? serviceUrl = ())
         returns Token|TokenAcquisitionError {
+    oauth2:ClientConfiguration clientConfig = credential.clientConfig;
     http:Client|http:ClientError tokenClient = new (credential.tokenUrl,
-        toHttpClientConfig(credential.clientConfig));
+        toHttpClientConfig(clientConfig));
     if tokenClient is http:ClientError {
         return error TokenAcquisitionError("Failed to create HTTP client for token endpoint",
             detail = {cause: tokenClient});
@@ -120,20 +123,16 @@ isolated function fetchClientCredentialToken(ClientCredential credential, string
             formData[k] = v;
         }
     }
-
-    map<string|string[]> headers = {CONTENT_TYPE_HEADER: APPLICATION_X_WWW_FORM_URLENCODED};
-    map<string>? customHeaders = credential.clientConfig.customHeaders;
-    if customHeaders is map<string> {
-        foreach var [k, v] in customHeaders.entries() {
-            headers[k] = v;
-        }
+    // Tool-level serviceUrl overrides any resource set in optionalParams (RFC 8707)
+    if serviceUrl is string {
+        formData["resource"] = serviceUrl;
     }
 
     ClientSecret|PrivateKeyJwt clientAuth = credential.clientAuth;
     if clientAuth is ClientSecret {
         if clientAuth.method != BODY {
             string raw = credential.clientId + ":" + clientAuth.secret;
-            headers["Authorization"] = "Basic " + raw.toBytes().toBase64();
+            formData["__authorization__"] = "Basic " + raw.toBytes().toBase64();
         } else {
             formData["client_secret"] = clientAuth.secret;
         }
@@ -144,12 +143,31 @@ isolated function fetchClientCredentialToken(ClientCredential credential, string
 
     string[] parts = [];
     foreach var [k, v] in formData.entries() {
-        string|error encoded = url:encode(v, UTF8_ENCODING);
-        parts.push(string `${k}=${encoded is string ? encoded : v}`);
+        if !k.startsWith("__") {
+            string|error encoded = url:encode(v, UTF8_ENCODING);
+            parts.push(string `${k}=${encoded is string ? encoded : v}`);
+        }
     }
     string body = string:'join(AMPERSAND, ...parts);
 
-    Token|error result = tokenClient->post("", body, headers);
+    http:Request tokenReq = new;
+    tokenReq.setTextPayload(body, APPLICATION_X_WWW_FORM_URLENCODED);
+
+    // Set Authorization header for client_secret_basic
+    string? authorizationHeader = formData["__authorization__"];
+    if authorizationHeader is string {
+        tokenReq.setHeader("Authorization", authorizationHeader);
+    }
+
+    // Merge any custom headers from clientConfig
+    map<string>? customHeaders = credential.clientConfig.customHeaders;
+    if customHeaders is map<string> {
+        foreach var [k, v] in customHeaders.entries() {
+            tokenReq.setHeader(k, v);
+        }
+    }
+
+    Token|error result = tokenClient->post("", tokenReq);
     if result is error {
         log:printError("Failed to obtain access token via client_credentials",
             'error = result, clientId = credential.clientId, tokenUrl = credential.tokenUrl);
@@ -379,16 +397,18 @@ isolated function addToken(string toolName, Token token, cache:Cache tokenManage
 isolated function validateToken(string toolName, Token token, cache:Cache tokenManager,
         decimal clockSkew = 10, decimal defaultExpTime = 3600) returns error|map<()> {
     observe:ValidateTokenSpan validateTokenSpan = observe:createValidateTokenSpan("WSO2");
-    jwt:Payload|error decoded = jwt:decode(token.access_token).ensureType();
-    if decoded is error {
-        // Opaque (non-JWT) token — rely on the expires_in from the token response or the default.
-        int expiry = token.expires_in > 0 ? token.expires_in : <int>defaultExpTime;
-        token.expires_in = expiry;
+    [jwt:Header, jwt:Payload]|error decodeResult = jwt:decode(token.access_token);
+    if decodeResult is error {
+        // Opaque (non-JWT) token — expires_in from the response is a duration in seconds.
+        // Convert to an epoch timestamp so TokenCache can compare against time:utcNow().
+        [int, decimal] nowForOpaque = time:utcNow();
+        int duration = token.expires_in > 0 ? token.expires_in : <int>defaultExpTime;
+        token.expires_in = nowForOpaque[0] + duration;
         validateTokenSpan.addValidationResult(true, "", ());
         validateTokenSpan.close();
         return addToken(toolName, token, tokenManager, clockSkew);
     }
-    jwt:Payload jwtPayload = decoded;
+    jwt:Payload jwtPayload = decodeResult[1];
     [int, decimal] currentTime = time:utcNow();
     if (currentTime[0] <= jwtPayload?.exp) {
         token.scope = jwtPayload["scope"].toString();
